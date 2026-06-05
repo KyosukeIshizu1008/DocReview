@@ -1,7 +1,16 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+
+/// CARGO_MANIFEST_DIR/models をキャッシュとして返す（無ければ None で fastembed のデフォルトに任せる）。
+fn repo_model_cache_dir() -> Option<PathBuf> {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let dir = PathBuf::from(manifest).join("models");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
 
 /// 埋め込みベクター生成のインターフェース。
 #[allow(async_fn_in_trait)]
@@ -21,10 +30,14 @@ impl LocalEmbedder {
     pub const DIM: usize = 384;
 
     pub fn new() -> Result<Self> {
-        let model = TextEmbedding::try_new(
-            InitOptions::new(Self::MODEL).with_show_download_progress(true),
-        )
-        .context("fastembed model init failed")?;
+        // リポジトリに同梱した models/ をキャッシュとして使う。
+        // 社内ネットワークで HuggingFace に直接アクセスできない環境でも、
+        // ここにモデルが事前配置されていれば DL をスキップして起動できる。
+        let mut opts = InitOptions::new(Self::MODEL).with_show_download_progress(true);
+        if let Some(dir) = repo_model_cache_dir() {
+            opts = opts.with_cache_dir(dir);
+        }
+        let model = TextEmbedding::try_new(opts).context("fastembed model init failed")?;
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
         })

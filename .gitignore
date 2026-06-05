@@ -4,3 +4,4 @@ Cargo.lock
 /data
 .env
 /.fastembed_cache
+models/**/*.lock
