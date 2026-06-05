@@ -9,7 +9,7 @@ pub mod confluence;
 pub mod jira;
 
 pub use confluence::{ConfluenceAttachment, ConfluencePage};
-pub use jira::{JiraAttachment, JiraIssue};
+pub use jira::JiraIssue;
 
 #[derive(Clone)]
 pub struct AtlassianClient {

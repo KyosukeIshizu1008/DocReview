@@ -119,25 +119,6 @@ impl LanceStore {
         Ok(out)
     }
 
-    /// 指定 id のチャンクを1件取得
-    pub async fn get_by_id(&self, id: &str) -> Result<Option<Chunk>> {
-        use lancedb::query::ExecutableQuery;
-        let table = self.table().await?;
-        let q = table
-            .query()
-            .only_if(format!("id = '{}'", escape_sql(id)))
-            .limit(1);
-        let stream = q.execute().await?;
-        let batches: Vec<RecordBatch> = stream.try_collect().await?;
-        for b in batches {
-            let hits = batch_to_hits(&b)?;
-            if let Some(h) = hits.into_iter().next() {
-                return Ok(Some(h.chunk));
-            }
-        }
-        Ok(None)
-    }
-
     /// 行数が `min_rows` 以上なら IVF_PQ index を作成（既存ならスキップ）。
     /// 数百件未満では brute force のほうが速いので min_rows のしきい値を使う。
     pub async fn ensure_vector_index(&self, min_rows: usize) -> Result<()> {

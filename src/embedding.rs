@@ -6,7 +6,6 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 /// 埋め込みベクター生成のインターフェース。
 #[allow(async_fn_in_trait)]
 pub trait Embedder: Send + Sync {
-    fn dim(&self) -> usize;
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
 }
 
@@ -15,7 +14,6 @@ pub trait Embedder: Send + Sync {
 /// 初回起動時に HuggingFace から ONNX モデルがダウンロードされる (~120MB)。
 pub struct LocalEmbedder {
     model: Arc<Mutex<TextEmbedding>>,
-    dim: usize,
 }
 
 impl LocalEmbedder {
@@ -29,16 +27,11 @@ impl LocalEmbedder {
         .context("fastembed model init failed")?;
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
-            dim: Self::DIM,
         })
     }
 }
 
 impl Embedder for LocalEmbedder {
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
@@ -80,9 +73,6 @@ impl Default for DummyEmbedder {
 }
 
 impl Embedder for DummyEmbedder {
-    fn dim(&self) -> usize {
-        self.dim
-    }
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         Ok(texts.iter().map(|_| vec![0.0_f32; self.dim]).collect())
     }

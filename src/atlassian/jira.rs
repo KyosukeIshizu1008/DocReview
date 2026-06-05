@@ -23,19 +23,16 @@ pub struct JiraFields {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct JiraAttachment {
-    pub id: String,
     pub filename: String,
     #[serde(rename = "mimeType")]
     pub mime_type: Option<String>,
     /// ダウンロード用 URL（フル URL で返ってくる）
     pub content: Option<String>,
-    pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct JiraProject {
     pub key: String,
-    pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

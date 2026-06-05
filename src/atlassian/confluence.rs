@@ -26,7 +26,6 @@ pub struct PageVersion {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PageBody {
     pub storage: Option<PageBodyVariant>,
-    pub atlas_doc_format: Option<PageBodyVariant>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -53,12 +52,9 @@ struct PaginationLinks {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfluenceAttachment {
-    pub id: String,
     pub title: String,
     #[serde(rename = "mediaType")]
     pub media_type: Option<String>,
-    #[serde(rename = "fileSize")]
-    pub file_size: Option<u64>,
     #[serde(rename = "downloadLink")]
     pub download_link: Option<String>,
     #[serde(rename = "_links")]

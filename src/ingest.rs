@@ -566,9 +566,6 @@ mod tests {
     }
 
     impl Embedder for HashEmbedder {
-        fn dim(&self) -> usize {
-            self.dim
-        }
         async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
             Ok(texts.iter().map(|t| hash_to_vec(t, self.dim)).collect())
         }
@@ -596,12 +593,10 @@ mod tests {
         })
     }
 
-    fn att(id: &str, title: &str, media: Option<&str>) -> ConfluenceAttachment {
+    fn att(_id: &str, title: &str, media: Option<&str>) -> ConfluenceAttachment {
         ConfluenceAttachment {
-            id: id.into(),
             title: title.into(),
             media_type: media.map(|s| s.into()),
-            file_size: None,
             download_link: Some(format!("/wiki/download/attachments/x/{title}")),
             links: None,
         }

@@ -194,11 +194,6 @@ fn compress_whitespace(s: &str) -> String {
     out
 }
 
-/// 旧 API 互換のため残す。`parse_confluence_storage().text` と等価。
-pub fn html_to_text(html: &str) -> String {
-    parse_confluence_storage(html).text
-}
-
 /// Jira ADF (Atlassian Document Format / JSON) からテキストを抽出。
 /// 主要なノード種別に対応:
 /// - text / paragraph / heading
