@@ -4,4 +4,5 @@ Cargo.lock
 /data
 .env
 /.fastembed_cache
-models/**/*.lock
+# 埋め込みは Gemini API に移行したためローカルモデルは追跡しない
+/models
