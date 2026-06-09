@@ -66,12 +66,7 @@ impl VisionClient {
             .and_then(|mut c| c.pop())
             .and_then(|c| c.content)
             .and_then(|c| c.parts)
-            .map(|parts| {
-                parts
-                    .into_iter()
-                    .filter_map(|p| p.text)
-                    .collect::<String>()
-            })
+            .map(|parts| parts.into_iter().filter_map(|p| p.text).collect::<String>())
             .unwrap_or_default();
         Ok(text)
     }

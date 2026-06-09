@@ -1,15 +1,30 @@
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use serde::{Deserialize, Serialize};
 
-/// CARGO_MANIFEST_DIR/models をキャッシュとして返す（無ければ None で fastembed のデフォルトに任せる）。
-fn repo_model_cache_dir() -> Option<PathBuf> {
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let dir = PathBuf::from(manifest).join("models");
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir)
+/// 埋め込みベクターの次元。Gemini `text-embedding-004` のネイティブ次元に合わせる。
+/// `outputDimensionality` で常にこの次元に固定するため、別モデルに替えても DB スキーマは不変。
+pub const EMBED_DIM: usize = 768;
+
+const GEMINI_API: &str = "https://generativelanguage.googleapis.com/v1beta/models";
+const DEFAULT_MODEL: &str = "text-embedding-004";
+/// レート制限(429)/一時障害(5xx)/通信エラー時のリトライ上限。
+const MAX_EMBED_ATTEMPTS: u32 = 5;
+
+/// 指数バックオフ: 0.5s, 1s, 2s, 4s, 8s（上限 8s）。
+fn backoff(attempt: u32) -> Duration {
+    let ms = 500u64.saturating_mul(1u64 << (attempt - 1).min(5));
+    Duration::from_millis(ms.min(8000))
+}
+
+/// 429 の Retry-After ヘッダ（秒）を尊重する。
+fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
 }
 
 /// 埋め込みベクター生成のインターフェース。
@@ -18,75 +33,157 @@ pub trait Embedder: Send + Sync {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
 }
 
-/// fastembed-rs を使ったローカル埋め込み。
-/// MultilingualE5Small (384 dim) を採用 — 日本語含む多言語対応かつ軽量。
-/// 初回起動時に HuggingFace から ONNX モデルがダウンロードされる (~120MB)。
-pub struct LocalEmbedder {
-    model: Arc<Mutex<TextEmbedding>>,
+/// Gemini の埋め込み API を使うリモート埋め込み。
+/// ローカル ONNX ランタイム/モデルのダウンロードが不要で、社内ネットワークで
+/// HuggingFace に到達できない環境でも動く（その代わり実行時に Google への通信が必要）。
+pub struct GeminiEmbedder {
+    api_key: String,
+    model: String,
+    http: reqwest::Client,
 }
 
-impl LocalEmbedder {
-    pub const MODEL: EmbeddingModel = EmbeddingModel::MultilingualE5Small;
-    pub const DIM: usize = 384;
-
-    pub fn new() -> Result<Self> {
-        // リポジトリに同梱した models/ をキャッシュとして使う。
-        // 社内ネットワークで HuggingFace に直接アクセスできない環境でも、
-        // ここにモデルが事前配置されていれば DL をスキップして起動できる。
-        let mut opts = InitOptions::new(Self::MODEL).with_show_download_progress(true);
-        if let Some(dir) = repo_model_cache_dir() {
-            opts = opts.with_cache_dir(dir);
+impl GeminiEmbedder {
+    pub fn new(api_key: String, model: String) -> Self {
+        let model = if model.trim().is_empty() {
+            DEFAULT_MODEL.to_owned()
+        } else {
+            model
+        };
+        Self {
+            api_key,
+            model,
+            http: reqwest::Client::new(),
         }
-        let model = TextEmbedding::try_new(opts).context("fastembed model init failed")?;
-        Ok(Self {
-            model: Arc::new(Mutex::new(model)),
-        })
     }
 }
 
-impl Embedder for LocalEmbedder {
+#[derive(Serialize)]
+struct BatchEmbedRequest {
+    requests: Vec<EmbedReq>,
+}
+
+#[derive(Serialize)]
+struct EmbedReq {
+    model: String,
+    content: EmbedContent,
+    #[serde(rename = "outputDimensionality")]
+    output_dimensionality: usize,
+}
+
+#[derive(Serialize)]
+struct EmbedContent {
+    parts: Vec<EmbedPart>,
+}
+
+#[derive(Serialize)]
+struct EmbedPart {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct BatchEmbedResponse {
+    embeddings: Vec<EmbeddingValues>,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingValues {
+    values: Vec<f32>,
+}
+
+/// L2 正規化（単位ベクトル化）。`outputDimensionality` でネイティブ未満に切り詰めた場合、
+/// Gemini の埋め込みは正規化されていないため、コサイン類似度の整合性のためここで正規化する。
+fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in &mut v {
+            *x /= norm;
+        }
+    }
+    v
+}
+
+impl Embedder for GeminiEmbedder {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        // multilingual-e5 は "query: ..." / "passage: ..." prefix を期待する。
-        // 索引化と検索の対称性を保つため、ここではすべて passage 扱いにしておく。
-        // (検索クエリ側でも passage prefix で OK な経験則。厳密にするなら別メソッドを切る)
-        let prefixed: Vec<String> = texts.iter().map(|t| format!("passage: {t}")).collect();
-        let model = self.model.clone();
-        let out = tokio::task::spawn_blocking(move || {
-            // poisoned でも guard を取り出して継続（モデル状態は推論で破壊されないため安全）
-            let mut guard = match model.lock() {
-                Ok(g) => g,
-                Err(poison) => {
-                    tracing::warn!("embedder mutex was poisoned; recovering");
-                    poison.into_inner()
+        if self.api_key.is_empty() {
+            anyhow::bail!(
+                "Gemini 埋め込み用 API キーが未設定です（設定タブの「埋め込み (Gemini)」で入力してください）"
+            );
+        }
+        let model_path = format!("models/{}", self.model);
+        let requests = texts
+            .iter()
+            .map(|t| EmbedReq {
+                model: model_path.clone(),
+                content: EmbedContent {
+                    parts: vec![EmbedPart { text: t.clone() }],
+                },
+                output_dimensionality: EMBED_DIM,
+            })
+            .collect();
+        let body = BatchEmbedRequest { requests };
+
+        let url = format!("{GEMINI_API}/{}:batchEmbedContents", self.model);
+        // 429 / 5xx / 通信エラーは指数バックオフでリトライ（大量チャンク同期が1回の失敗で落ちないように）
+        let parsed: BatchEmbedResponse = {
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                match self
+                    .http
+                    .post(&url)
+                    .header("x-goog-api-key", &self.api_key)
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            break resp.json().await.context("gemini embed decode")?;
+                        }
+                        let retryable = status.as_u16() == 429 || status.is_server_error();
+                        if retryable && attempt < MAX_EMBED_ATTEMPTS {
+                            let wait = retry_after(&resp).unwrap_or_else(|| backoff(attempt));
+                            let txt = resp.text().await.unwrap_or_default();
+                            tracing::warn!(
+                                "Gemini embed {status} (attempt {attempt}/{MAX_EMBED_ATTEMPTS}); \
+                                 retrying in {wait:?}: {txt}"
+                            );
+                            tokio::time::sleep(wait).await;
+                            continue;
+                        }
+                        let txt = resp.text().await.unwrap_or_default();
+                        anyhow::bail!("Gemini embed API {status}: {txt}");
+                    }
+                    Err(e) => {
+                        if attempt < MAX_EMBED_ATTEMPTS {
+                            let wait = backoff(attempt);
+                            tracing::warn!(
+                                "Gemini embed request error (attempt {attempt}/{MAX_EMBED_ATTEMPTS}); \
+                                 retrying in {wait:?}: {e}"
+                            );
+                            tokio::time::sleep(wait).await;
+                            continue;
+                        }
+                        return Err(anyhow::Error::new(e).context("gemini embed request"));
+                    }
                 }
-            };
-            guard.embed(prefixed, Some(32))
-        })
-        .await
-        .context("embed task join")?
-        .context("embed failed")?;
-        Ok(out)
-    }
-}
-
-/// 開発初期用のダミー実装。fastembed のダウンロードを避けたいテスト時に使う。
-#[allow(dead_code)]
-pub struct DummyEmbedder {
-    pub dim: usize,
-}
-
-#[allow(dead_code)]
-impl Default for DummyEmbedder {
-    fn default() -> Self {
-        Self { dim: 384 }
-    }
-}
-
-impl Embedder for DummyEmbedder {
-    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        Ok(texts.iter().map(|_| vec![0.0_f32; self.dim]).collect())
+            }
+        };
+        if parsed.embeddings.len() != texts.len() {
+            anyhow::bail!(
+                "gemini embed: expected {} embeddings, got {}",
+                texts.len(),
+                parsed.embeddings.len()
+            );
+        }
+        Ok(parsed
+            .embeddings
+            .into_iter()
+            .map(|e| normalize(e.values))
+            .collect())
     }
 }

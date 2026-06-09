@@ -37,16 +37,18 @@ where
         issues.len()
     )));
     let mut jira_chunks = jira_to_chunks(client, &issues);
-    if options.fetch_attachments && options.enable_vision && vision.is_some() {
-        let extras = jira_image_chunks(client, &issues, vision.unwrap(), options, &tx).await;
-        jira_chunks.extend(extras);
+    if let Some(vision) = vision {
+        if options.fetch_attachments && options.enable_vision {
+            let extras = jira_image_chunks(client, &issues, vision, options, &tx).await;
+            jira_chunks.extend(extras);
+        }
     }
     embed_and_upsert(embedder, store, jira_chunks, &tx, "jira").await?;
     let _ = tx.send(crate::app::SyncEvent::JiraDone(now_iso()));
 
     // ====== Confluence ======
     let _ = tx.send(crate::app::SyncEvent::Log("Confluence pages を取得".into()));
-    let pages = client.confluence_pages(5000).await?;
+    let pages = client.confluence_pages(5000, since).await?;
     let _ = tx.send(crate::app::SyncEvent::Log(format!(
         "Confluence: {} 件取得",
         pages.len()
@@ -280,7 +282,9 @@ async fn confluence_extras(
             for (di, drawio_name) in parsed.drawio_refs.iter().enumerate() {
                 let candidate = find_drawio_attachment(&attachments, drawio_name);
                 let Some(att) = candidate else { continue };
-                let Some(dl) = attachment_download_url(&att) else { continue };
+                let Some(dl) = attachment_download_url(att) else {
+                    continue;
+                };
                 let bytes = match client.download_bytes(&dl).await {
                     Ok((b, _)) => b,
                     Err(e) => {
@@ -330,7 +334,9 @@ async fn confluence_extras(
                 if !mime.starts_with("image/") {
                     continue;
                 }
-                let Some(dl) = attachment_download_url(att) else { continue };
+                let Some(dl) = attachment_download_url(att) else {
+                    continue;
+                };
                 let bytes = match client.download_bytes(&dl).await {
                     Ok((b, _)) => b,
                     Err(e) => {
@@ -388,7 +394,9 @@ async fn jira_image_chunks(
             if !mime.starts_with("image/") {
                 continue;
             }
-            let Some(url) = att.content.as_deref() else { continue };
+            let Some(url) = att.content.as_deref() else {
+                continue;
+            };
             let bytes = match client.download_bytes(url).await {
                 Ok((b, _)) => b,
                 Err(e) => {
@@ -480,7 +488,12 @@ fn find_drawio_attachment<'a>(
 
 fn normalize_name(s: &str) -> String {
     let lower = s.to_lowercase();
-    lower.split_whitespace().collect::<Vec<_>>().join(" ").trim().to_owned()
+    lower
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_owned()
 }
 
 fn base_name(s: &str) -> String {
@@ -517,11 +530,26 @@ where
     )));
 
     let mut done = 0usize;
+    let mut skipped = 0usize;
     for batch in chunks.chunks(EMBED_BATCH) {
-        let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
-        let vectors = embedder.embed(&texts).await?;
-        let recs: Vec<Chunk> = batch
+        // 既存行と updated_at が一致するチャンクは内容不変とみなし、再埋め込みをスキップする。
+        // 埋め込みは Gemini API 課金対象なので、増分同期時のコストを大きく下げられる。
+        let ids: Vec<String> = batch.iter().map(|c| c.id.clone()).collect();
+        let existing = store.updated_at_map(&ids).await.unwrap_or_default();
+        let pending: Vec<&PreChunk> = batch
             .iter()
+            .filter(|c| existing.get(&c.id) != Some(&c.updated_at))
+            .collect();
+        done += batch.len();
+        skipped += batch.len() - pending.len();
+        if pending.is_empty() {
+            continue;
+        }
+
+        let texts: Vec<String> = pending.iter().map(|c| c.text.clone()).collect();
+        let vectors = embedder.embed(&texts).await?;
+        let recs: Vec<Chunk> = pending
+            .into_iter()
             .zip(vectors)
             .map(|(p, v)| Chunk {
                 id: p.id.clone(),
@@ -539,9 +567,14 @@ where
             })
             .collect();
         store.upsert(recs).await?;
-        done += batch.len();
         let _ = tx.send(crate::app::SyncEvent::Log(format!(
-            "{label}: {done}/{total} upsert 完了"
+            "{label}: {done}/{total} 処理 (埋め込み {}, 未変更スキップ {skipped})",
+            done - skipped
+        )));
+    }
+    if skipped > 0 {
+        let _ = tx.send(crate::app::SyncEvent::Log(format!(
+            "{label}: 未変更 {skipped} 件の埋め込みをスキップしました"
         )));
     }
     Ok(())
@@ -583,6 +616,70 @@ mod tests {
             }
         }
         v
+    }
+
+    fn pre(id: &str, updated_at: i64, text: &str) -> PreChunk {
+        PreChunk {
+            id: id.to_owned(),
+            source_type: "jira".to_owned(),
+            source_id: id.to_owned(),
+            title: "t".to_owned(),
+            url: "u".to_owned(),
+            space_or_project: String::new(),
+            author: String::new(),
+            created_at: 0,
+            updated_at,
+            labels: vec![],
+            text: text.to_owned(),
+        }
+    }
+
+    /// updated_at が一致する既存チャンクは再埋め込みされないことを検証する。
+    #[tokio::test]
+    async fn embed_and_upsert_skips_unchanged() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingEmbedder {
+            dim: usize,
+            calls: AtomicUsize,
+        }
+        impl Embedder for CountingEmbedder {
+            async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+                self.calls.fetch_add(texts.len(), Ordering::SeqCst);
+                Ok(texts.iter().map(|t| hash_to_vec(t, self.dim)).collect())
+            }
+        }
+
+        let emb = CountingEmbedder {
+            dim: 8,
+            calls: AtomicUsize::new(0),
+        };
+        let store = InMemoryStore::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        // 初回: 2 件とも埋め込み
+        embed_and_upsert(
+            &emb,
+            &store,
+            vec![pre("a", 1, "x"), pre("b", 1, "y")],
+            &tx,
+            "jira",
+        )
+        .await
+        .unwrap();
+        assert_eq!(emb.calls.load(Ordering::SeqCst), 2);
+
+        // 2 回目: a は updated_at 据え置き → スキップ、b は更新 → 再埋め込みのみ
+        embed_and_upsert(
+            &emb,
+            &store,
+            vec![pre("a", 1, "x"), pre("b", 2, "y2")],
+            &tx,
+            "jira",
+        )
+        .await
+        .unwrap();
+        assert_eq!(emb.calls.load(Ordering::SeqCst), 3);
     }
 
     fn mk_client(server: &MockServer) -> AtlassianClient {
@@ -673,7 +770,9 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/wiki/api/v2/pages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"results": []})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"results": []})),
+            )
             .mount(&server)
             .await;
 
@@ -686,7 +785,9 @@ mod tests {
             parse_drawio: false,
             enable_vision: false,
             max_images_per_doc: 0,
-            vision_model: "".into(), auto_review_new_pages: false, max_auto_reviews: 0,
+            vision_model: "".into(),
+            auto_review_new_pages: false,
+            max_auto_reviews: 0,
         };
 
         run_sync(&client, &embedder, &store, None, &opts, tx, None)
@@ -694,7 +795,11 @@ mod tests {
             .expect("run_sync");
 
         let hits = store
-            .search(&hash_to_vec("ログイン障害", 8), 10, &SearchFilter::default())
+            .search(
+                &hash_to_vec("ログイン障害", 8),
+                10,
+                &SearchFilter::default(),
+            )
             .await
             .unwrap();
         assert!(!hits.is_empty(), "no chunks created");
@@ -713,7 +818,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/rest/api/3/search/jql"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"issues": []})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"issues": []})),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -739,7 +846,9 @@ mod tests {
             parse_drawio: false,
             enable_vision: false,
             max_images_per_doc: 0,
-            vision_model: "".into(), auto_review_new_pages: false, max_auto_reviews: 0,
+            vision_model: "".into(),
+            auto_review_new_pages: false,
+            max_auto_reviews: 0,
         };
 
         run_sync(&client, &embedder, &store, None, &opts, tx, None)
@@ -747,7 +856,11 @@ mod tests {
             .unwrap();
 
         let hits = store
-            .search(&hash_to_vec("認証フロー設計", 8), 10, &SearchFilter::default())
+            .search(
+                &hash_to_vec("認証フロー設計", 8),
+                10,
+                &SearchFilter::default(),
+            )
             .await
             .unwrap();
         let conf = hits
@@ -777,7 +890,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/rest/api/3/search/jql"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"issues": []})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"issues": []})),
+            )
             .mount(&server)
             .await;
         // page 一覧
@@ -823,7 +938,9 @@ mod tests {
             parse_drawio: true,
             enable_vision: false,
             max_images_per_doc: 0,
-            vision_model: "".into(), auto_review_new_pages: false, max_auto_reviews: 0,
+            vision_model: "".into(),
+            auto_review_new_pages: false,
+            max_auto_reviews: 0,
         };
 
         run_sync(&client, &embedder, &store, None, &opts, tx, None)
@@ -831,7 +948,11 @@ mod tests {
             .unwrap();
 
         let hits = store
-            .search(&hash_to_vec("ユーザー API Gateway", 8), 10, &SearchFilter::default())
+            .search(
+                &hash_to_vec("ユーザー API Gateway", 8),
+                10,
+                &SearchFilter::default(),
+            )
             .await
             .unwrap();
         // drawio チャンクが含まれることを id 形式で確認

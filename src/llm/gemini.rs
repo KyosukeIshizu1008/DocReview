@@ -92,9 +92,8 @@ impl Llm for GeminiClient {
         user_text.push_str("## 質問\n\n");
         user_text.push_str(&req.user);
         if !req.documents.is_empty() {
-            user_text.push_str(
-                "\n\n回答時は根拠となる参照を `[n]` 形式で本文中に明示してください。",
-            );
+            user_text
+                .push_str("\n\n回答時は根拠となる参照を `[n]` 形式で本文中に明示してください。");
         }
 
         let mut contents: Vec<Content> = Vec::with_capacity(req.history.len() + 1);

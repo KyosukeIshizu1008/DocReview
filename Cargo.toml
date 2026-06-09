@@ -41,15 +41,11 @@ text-splitter = "0.20"
 quick-xml = "0.36"
 flate2 = "1"
 
-# --- Vector DB & local embeddings ---
+# --- Vector DB ---
+# 埋め込みは Gemini API (reqwest 経由) を使うため、ローカル ONNX ランタイムは不要。
 lancedb = "0.30"
 arrow-array = "58"
 arrow-schema = "58"
-fastembed = { version = "5", default-features = false, features = [
-    "ort-download-binaries-native-tls",
-    "hf-hub-native-tls",
-    "image-models",
-] }
 
 # --- Date/time ---
 chrono = { version = "0.4", features = ["serde"] }

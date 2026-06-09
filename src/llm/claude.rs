@@ -145,7 +145,11 @@ impl Llm for ClaudeClient {
         let mut content = String::new();
         let mut citations: Vec<Citation> = vec![];
         for b in parsed.content {
-            if let ResponseBlock::Text { text, citations: cs } = b {
+            if let ResponseBlock::Text {
+                text,
+                citations: cs,
+            } = b
+            {
                 content.push_str(&text);
                 for c in cs {
                     let title = c.document_title.unwrap_or_default();

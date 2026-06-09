@@ -129,7 +129,10 @@ mod tests {
             .await;
 
         let client = client_for(&server);
-        let issues = client.jira_search("ORDER BY updated DESC", 100).await.unwrap();
+        let issues = client
+            .jira_search("ORDER BY updated DESC", 100)
+            .await
+            .unwrap();
         assert_eq!(issues.len(), 3);
         assert_eq!(issues[0].key, "P-1");
         assert_eq!(issues[2].key, "P-3");
@@ -150,7 +153,10 @@ mod tests {
             .mount(&server)
             .await;
         let client = client_for(&server);
-        let issues = client.jira_search("ORDER BY updated DESC", 50).await.unwrap();
+        let issues = client
+            .jira_search("ORDER BY updated DESC", 50)
+            .await
+            .unwrap();
         assert_eq!(issues.len(), 50);
     }
 
@@ -162,6 +168,9 @@ mod tests {
             api_token: "y".into(),
         });
         // trailing slash should be trimmed
-        assert_eq!(client.issue_url("ABC-123"), "https://my.atlassian.net/browse/ABC-123");
+        assert_eq!(
+            client.issue_url("ABC-123"),
+            "https://my.atlassian.net/browse/ABC-123"
+        );
     }
 }

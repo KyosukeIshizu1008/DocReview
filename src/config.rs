@@ -15,6 +15,27 @@ pub struct AppConfig {
     pub sync_state: SyncState,
     #[serde(default)]
     pub ingest: IngestOptions,
+    #[serde(default)]
+    pub embedding: EmbeddingConfig,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct EmbeddingConfig {
+    /// Gemini 埋め込みモデル名（例: text-embedding-004）
+    pub model: String,
+    /// Gemini API キー。空なら LLM が Gemini のときそのキーを流用する。
+    /// メモリ上のみで保持し、永続化は keyring 経由。
+    #[serde(skip)]
+    pub api_key: String,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            model: "text-embedding-004".to_owned(),
+            api_key: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -112,6 +133,9 @@ impl AppConfig {
         if let Ok(key) = get_secret("llm_api_key") {
             cfg.llm.api_key = key;
         }
+        if let Ok(key) = get_secret("embedding_api_key") {
+            cfg.embedding.api_key = key;
+        }
         Ok(cfg)
     }
 
@@ -126,6 +150,7 @@ impl AppConfig {
         // secrets: keyring に書く
         set_secret("atlassian_token", &self.atlassian.api_token)?;
         set_secret("llm_api_key", &self.llm.api_key)?;
+        set_secret("embedding_api_key", &self.embedding.api_key)?;
         Ok(())
     }
 }

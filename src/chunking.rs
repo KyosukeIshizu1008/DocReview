@@ -399,7 +399,11 @@ mod tests {
     fn split_long_text_yields_multiple_chunks() {
         let long = "あ".repeat(3000);
         let chunks = split(&long);
-        assert!(chunks.len() > 1, "expected multiple chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() > 1,
+            "expected multiple chunks, got {}",
+            chunks.len()
+        );
         for c in &chunks {
             assert!(c.chars().count() <= CHUNK_CHARS + CHUNK_OVERLAP);
         }
@@ -550,7 +554,12 @@ mod tests {
   </ac:parameter>
 </ac:structured-macro>"#;
         let r = parse_confluence_storage(html);
-        assert_eq!(r.mermaid_blocks.len(), 1, "got blocks: {:?}", r.mermaid_blocks);
+        assert_eq!(
+            r.mermaid_blocks.len(),
+            1,
+            "got blocks: {:?}",
+            r.mermaid_blocks
+        );
         assert!(r.mermaid_blocks[0].contains("graph TD"));
         assert!(r.mermaid_blocks[0].contains("A --> B"));
     }
@@ -573,7 +582,10 @@ mod tests {
 </ac:structured-macro>"#;
         let r = parse_confluence_storage(html);
         assert!(r.text.contains("visible"));
-        assert!(!r.text.contains("Hidden"), "drawio param leaked into body: {}", r.text);
+        assert!(
+            !r.text.contains("Hidden"),
+            "drawio param leaked into body: {}",
+            r.text
+        );
     }
 }
-

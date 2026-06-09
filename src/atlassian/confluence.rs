@@ -75,10 +75,7 @@ struct AttachmentsResponse {
 
 impl AtlassianClient {
     /// ページに紐づく添付ファイル一覧を取得（pagination 対応）
-    pub async fn confluence_attachments(
-        &self,
-        page_id: &str,
-    ) -> Result<Vec<ConfluenceAttachment>> {
+    pub async fn confluence_attachments(&self, page_id: &str) -> Result<Vec<ConfluenceAttachment>> {
         let mut out: Vec<ConfluenceAttachment> = vec![];
         let mut url = format!(
             "{}/wiki/api/v2/pages/{}/attachments?limit=100",
@@ -105,19 +102,42 @@ impl AtlassianClient {
 
     /// Confluence Cloud v2 API でページ一覧 + body.storage を取得。
     /// `_links.next` を辿って max_total 件まで取得。
-    pub async fn confluence_pages(&self, max_total: usize) -> Result<Vec<ConfluencePage>> {
+    /// Confluence ページを取得する。
+    /// `since`(ISO8601)を指定すると最終更新が新しい順に取得し、`since` より古いページに
+    /// 到達した時点でページングを打ち切る（増分同期）。`None` なら全件。
+    pub async fn confluence_pages(
+        &self,
+        max_total: usize,
+        since: Option<&str>,
+    ) -> Result<Vec<ConfluencePage>> {
         const PER_PAGE: u32 = 100;
+        let since_ts = since.map(|s| crate::chunking::parse_iso(Some(s)));
         let mut out: Vec<ConfluencePage> = vec![];
+        // sort=-modified-date: 更新が新しい順。since 境界で打ち切れるようにする。
         let mut url = format!(
-            "{}/wiki/api/v2/pages?limit={}&body-format=storage",
+            "{}/wiki/api/v2/pages?limit={}&body-format=storage&sort=-modified-date",
             self.site(),
             PER_PAGE
         );
-        loop {
+        'outer: loop {
             let resp: PagesResponse = self.get_json(&url).await?;
-            out.extend(resp.results);
-            if out.len() >= max_total {
-                break;
+            for page in resp.results {
+                if let Some(since_ts) = since_ts {
+                    let modified = page
+                        .version
+                        .as_ref()
+                        .and_then(|v| v.created_at.as_deref())
+                        .map(|s| crate::chunking::parse_iso(Some(s)))
+                        .unwrap_or(0);
+                    // 更新日時が取れていて、かつ since より古ければ以降は全て古い → 打ち切り
+                    if modified != 0 && modified < since_ts {
+                        break 'outer;
+                    }
+                }
+                out.push(page);
+                if out.len() >= max_total {
+                    break 'outer;
+                }
             }
             let next = resp.links.as_ref().and_then(|l| l.next.clone());
             match next {
@@ -188,7 +208,7 @@ mod tests {
             .await;
 
         let client = client_for(&server);
-        let pages = client.confluence_pages(100).await.unwrap();
+        let pages = client.confluence_pages(100, None).await.unwrap();
         assert_eq!(pages.len(), 3);
         assert_eq!(pages[0].id, "p1");
         assert_eq!(pages[2].id, "p3");
@@ -209,7 +229,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = client_for(&server);
-        let pages = client.confluence_pages(20).await.unwrap();
+        let pages = client.confluence_pages(20, None).await.unwrap();
         assert_eq!(pages.len(), 20);
     }
 

@@ -1,26 +1,27 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch,
     RecordBatchIterator, StringArray,
 };
-use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
-use lancedb::Connection;
-use lancedb::index::Index;
 use lancedb::index::vector::IvfPqIndexBuilder;
+use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::Connection;
 use serde::{Deserialize, Serialize};
 
 /// LanceDB に入れるレコード
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chunk {
     pub id: String,
-    pub source_type: String,   // "jira" | "confluence"
-    pub source_id: String,     // issue key / page id
+    pub source_type: String, // "jira" | "confluence"
+    pub source_id: String,   // issue key / page id
     pub title: String,
     pub url: String,
     pub space_or_project: String,
@@ -53,6 +54,9 @@ pub trait VectorStore: Send + Sync {
         top_k: usize,
         filter: &SearchFilter,
     ) -> Result<Vec<SearchHit>>;
+    /// 指定 id 群について既存行の updated_at を返す（未登録 id は含めない）。
+    /// 未変更チャンクの再埋め込みをスキップするために使う。
+    async fn updated_at_map(&self, ids: &[String]) -> Result<HashMap<String, i64>>;
 }
 
 const TABLE_NAME: &str = "chunks";
@@ -73,7 +77,28 @@ impl LanceStore {
         let schema = Arc::new(build_schema(dim));
 
         let names = conn.table_names().execute().await?;
-        if !names.iter().any(|n| n == TABLE_NAME) {
+        if names.iter().any(|n| n == TABLE_NAME) {
+            // 既存テーブルのベクター次元が要求と異なる場合（埋め込みモデル変更時など）は
+            // スキーマ不整合になるため作り直す。中身は失われるので再同期が必要。
+            let existing_dim = match conn.open_table(TABLE_NAME).execute().await {
+                Ok(t) => {
+                    let s = t.schema().await?;
+                    vector_dim_of(s.as_ref())
+                }
+                Err(_) => None,
+            };
+            if existing_dim != Some(dim) {
+                tracing::warn!(
+                    "vector dimension changed (existing={existing_dim:?}, expected={dim}); \
+                     recreating '{TABLE_NAME}' table — re-sync required"
+                );
+                conn.drop_table(TABLE_NAME, &[]).await.ok();
+                conn.create_empty_table(TABLE_NAME, schema.clone())
+                    .execute()
+                    .await
+                    .context("recreate table")?;
+            }
+        } else {
             conn.create_empty_table(TABLE_NAME, schema.clone())
                 .execute()
                 .await
@@ -176,6 +201,31 @@ impl VectorStore for LanceStore {
         }
         Ok(hits)
     }
+
+    async fn updated_at_map(&self, ids: &[String]) -> Result<HashMap<String, i64>> {
+        let mut map = HashMap::new();
+        if ids.is_empty() {
+            return Ok(map);
+        }
+        let table = self.table().await?;
+        let list = ids
+            .iter()
+            .map(|i| format!("'{}'", escape_sql(i)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let stream = table
+            .query()
+            .only_if(format!("id IN ({list})"))
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        for b in batches {
+            for h in batch_to_hits(&b)? {
+                map.insert(h.chunk.id, h.chunk.updated_at);
+            }
+        }
+        Ok(map)
+    }
 }
 
 fn build_filter_expr(filter: &SearchFilter) -> Option<String> {
@@ -212,6 +262,14 @@ fn escape_sql(s: &str) -> String {
         }
     }
     out
+}
+
+/// スキーマの `vector` 列の FixedSizeList 次元を取り出す。
+fn vector_dim_of(schema: &Schema) -> Option<usize> {
+    match schema.field_with_name("vector").ok()?.data_type() {
+        DataType::FixedSizeList(_, n) => Some(*n as usize),
+        _ => None,
+    }
 }
 
 fn build_schema(dim: usize) -> Schema {
@@ -372,7 +430,13 @@ fn batch_to_hits(batch: &RecordBatch) -> Result<Vec<SearchHit>> {
             url: url.value(i).to_string(),
             space_or_project: space_or_project.value(i).to_string(),
             author: author
-                .map(|a| if a.is_null(i) { String::new() } else { a.value(i).to_string() })
+                .map(|a| {
+                    if a.is_null(i) {
+                        String::new()
+                    } else {
+                        a.value(i).to_string()
+                    }
+                })
                 .unwrap_or_default(),
             created_at: created_at.value(i),
             updated_at: updated_at.value(i),
@@ -445,9 +509,22 @@ impl VectorStore for InMemoryStore {
                 chunk: c.clone(),
             })
             .collect();
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(top_k);
         Ok(scored)
+    }
+
+    async fn updated_at_map(&self, ids: &[String]) -> Result<HashMap<String, i64>> {
+        let want: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let g = self.inner.read().await;
+        Ok(g.iter()
+            .filter(|c| want.contains(c.id.as_str()))
+            .map(|c| (c.id.clone(), c.updated_at))
+            .collect())
     }
 }
 
@@ -596,7 +673,9 @@ mod tests {
     #[tokio::test]
     async fn lance_store_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = LanceStore::open(tmp.path(), 4).await.expect("open lance store");
+        let store = LanceStore::open(tmp.path(), 4)
+            .await
+            .expect("open lance store");
         let chunks = vec![
             mk_chunk("a", "jira", "PROJ", vec![1.0, 0.0, 0.0, 0.0]),
             mk_chunk("b", "confluence", "DOCS", vec![0.0, 1.0, 0.0, 0.0]),

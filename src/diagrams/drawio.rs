@@ -85,8 +85,11 @@ pub fn parse_drawio(bytes: &[u8]) -> Result<DrawioDiagram> {
                             // mxGraphModel ルートを探して読む
                             loop {
                                 match sub_reader.read_event_into(&mut sub_buf) {
-                                    Ok(Event::Start(e2)) if e2.name().as_ref() == b"mxGraphModel" => {
-                                        let page = parse_mxgraph_model(&mut sub_reader, &mut sub_buf)?;
+                                    Ok(Event::Start(e2))
+                                        if e2.name().as_ref() == b"mxGraphModel" =>
+                                    {
+                                        let page =
+                                            parse_mxgraph_model(&mut sub_reader, &mut sub_buf)?;
                                         diagram.pages.push(DrawioPage {
                                             name: current_page_name.clone(),
                                             nodes: page.nodes,
@@ -330,8 +333,14 @@ mod tests {
         let text = to_text(&d, Some("Sample"));
         assert!(text.contains("Sample"), "title missing: {text}");
         assert!(text.contains("User"), "node missing: {text}");
-        assert!(text.contains("User -> API Gateway: HTTP request"), "edge missing: {text}");
-        assert!(text.contains("API Gateway -> Auth Server: validate"), "edge missing: {text}");
+        assert!(
+            text.contains("User -> API Gateway: HTTP request"),
+            "edge missing: {text}"
+        );
+        assert!(
+            text.contains("API Gateway -> Auth Server: validate"),
+            "edge missing: {text}"
+        );
     }
 
     #[test]

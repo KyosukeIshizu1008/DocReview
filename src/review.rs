@@ -108,6 +108,7 @@ const USER_TEMPLATE: &str = "\
 
 /// ドキュメントをレビュー。
 /// `text` を embed → 既存ナレッジ top-K を集める → LLM に JSON 構造で出力させる → パース
+#[allow(clippy::too_many_arguments)]
 pub async fn review_document<E, V, L>(
     title: &str,
     source_id: &str,
@@ -135,7 +136,7 @@ where
     let mut seen_ids = std::collections::HashSet::<String>::new();
     for chunk_text in &new_chunks {
         let q_vec = embedder
-            .embed(&[chunk_text.clone()])
+            .embed(std::slice::from_ref(chunk_text))
             .await?
             .into_iter()
             .next()

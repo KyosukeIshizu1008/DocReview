@@ -42,12 +42,12 @@ fn main() -> Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 760.0])
             .with_min_inner_size([800.0, 600.0])
-            .with_title("JiraAI - Jira & Confluence RAG"),
+            .with_title("Atlas — Jira & Confluence RAG"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "JiraAI",
+        "Atlas",
         native_options,
         Box::new(|cc| Ok(Box::new(app::JiraAiApp::new(cc)?))),
     )
